@@ -351,7 +351,8 @@ class Route53DNSProvider(DNSProvider):
 
         - Ignores the specific subdomain in caa_record.name for placement
         - Uses it only to locate the correct hosted zone
-        - Merges hard-coded issuers with any existing CAA values on the apex
+        - Uses the caller-provided CAA value (with accounturi) for Let's Encrypt
+        - Merges AWS ACM issuers and existing CAA values on the apex
         """
         # Ensure we know which hosted zone this belongs to
         hosted_zone_id = self._ensure_hosted_zone_id(caa_record.name)
@@ -369,20 +370,23 @@ class Route53DNSProvider(DNSProvider):
         apex_name = self.hosted_zone_name  # apex of the zone
         normalized_name = self._normalize_record_name(apex_name)
 
-        # Hard-coded issuers for this bridge (Let's Encrypt + AWS ACM)
-        required_issuers = [
-            "letsencrypt.org",
+        # Use the caller-provided value for the LE CAA record (includes accounturi)
+        clean_value = caa_record.value.strip('"')
+        le_value = f'{caa_record.flags} {caa_record.tag} "{clean_value}"'
+
+        # AWS ACM issuers (always "issue" tag, bare values)
+        aws_issuers = [
             "amazon.com",
             "amazontrust.com",
             "awstrust.com",
             "amazonaws.com",
         ]
-
-        # Build the desired CAA "issue" values from the issuers
-        required_values = [
-            f'{caa_record.flags} {caa_record.tag} "{issuer}"'
-            for issuer in required_issuers
+        aws_values = [
+            f'{caa_record.flags} issue "{issuer}"'
+            for issuer in aws_issuers
         ]
+
+        required_values = [le_value] + aws_values
 
         # Look up any existing CAA RRSet on the apex
         paginator = self.client.get_paginator("list_resource_record_sets")
@@ -418,8 +422,16 @@ class Route53DNSProvider(DNSProvider):
         else:
             print(f"No existing CAA RRSet on apex {apex_name}, creating new one")
 
-        # Merge: keep all existing values, add any missing required issuer values
-        merged_values = list(existing_values)
+        # Remove any existing bare letsencrypt.org entries (without accounturi)
+        # so they get replaced by the accounturi-restricted version
+        bare_le_patterns = [
+            f'{caa_record.flags} issue "letsencrypt.org"',
+            f'{caa_record.flags} issuewild "letsencrypt.org"',
+        ]
+        merged_values = [
+            v for v in existing_values
+            if v not in bare_le_patterns
+        ]
         for value in required_values:
             if value not in merged_values:
                 merged_values.append(value)
